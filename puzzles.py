@@ -701,9 +701,9 @@ def dot_spec(x: Float32[4, 32, 32], y: Float32[4, 32, 32]) -> Float32[4, 32, 32]
 
 @triton.jit
 def dot_kernel(
-    x_ptr,
-    y_ptr,
-    z_ptr,
+    x_ptr,  # Shape: BMK[N2, N1, MID]
+    y_ptr,  # Shape: BKN[N2, MID, N0]
+    z_ptr,  # Shape: BMN[N2, N1, N0]
     N0,
     N1,
     N2,
@@ -713,10 +713,50 @@ def dot_kernel(
     B2: tl.constexpr,
     B_MID: tl.constexpr,
 ):
-    block_id_j = tl.program_id(0)
-    block_id_k = tl.program_id(1)
-    block_id_i = tl.program_id(2)
-    # Finish me!
+    # {'N0': 32, 'N1': 32, 'N2': 4, 'MID': 32} {'B0': 16, 'B1': 16, 'B2': 1, 'B_MID': 16}
+    block_id_n = tl.program_id(0)   # cdiv(N0, B0)
+    block_id_m = tl.program_id(1)   # cdiv(N1, B1)
+    block_id_b = tl.program_id(2)   # cdiv(N2, B2)
+    
+    # Output Shape: [B2, B1, B0]
+    idx_b = block_id_b * B2 + tl.arange(0, B2)
+    idx_m = block_id_m * B1 + tl.arange(0, B1)
+    idx_n = block_id_n * B0 + tl.arange(0, B0)
+
+    tile = tl.zeros([B2, B1, B0], dtype=tl.float32)
+
+    for k in tl.range(0, MID, B_MID):
+        # Load A, Shape [B2, B1, B_MID]
+        idx_k = k + tl.arange(0, B_MID)
+        idx_A = idx_b.expand_dims([1, 2]).broadcast_to(B2, B1, B_MID) * N1 * MID + \
+                idx_m.expand_dims([0, 2]).broadcast_to(B2, B1, B_MID) * MID + \
+                idx_k.expand_dims([0, 1]).broadcast_to(B2, B1, B_MID)
+        msk_A = (idx_b < N2).expand_dims([1, 2]).broadcast_to(B2, B1, B_MID) & \
+                (idx_m < N1).expand_dims([0, 2]).broadcast_to(B2, B1, B_MID) & \
+                (idx_k < MID).expand_dims([0, 1]).broadcast_to(B2, B1, B_MID)
+        
+        A = tl.load(x_ptr + idx_A, mask=msk_A)
+        
+        # Load B, Shape [B2, B_MID, B0]
+        idx_B = idx_b.expand_dims([1, 2]).broadcast_to(B2, B_MID, B0) * MID * N0 + \
+                idx_k.expand_dims([0, 2]).broadcast_to(B2, B_MID, B0) * N0 + \
+                idx_n.expand_dims([0, 1]).broadcast_to(B2, B_MID, B0)
+        msk_B = (idx_b < N2).expand_dims([1, 2]).broadcast_to(B2, B_MID, B0) & \
+                (idx_k < MID).expand_dims([0, 2]).broadcast_to(B2, B_MID, B0) & \
+                (idx_n < N0).expand_dims([0, 1]).broadcast_to(B2, B_MID, B0)
+        
+        B = tl.load(y_ptr + idx_B, mask=msk_B)
+
+        # MMA
+        tile += tl.dot(A, B)
+
+    idx_C = idx_b.expand_dims([1, 2]).broadcast_to(B2, B1, B0) * N1 * N0 + \
+            idx_m.expand_dims([0, 2]).broadcast_to(B2, B1, B0) * N0 + \
+            idx_n.expand_dims([0, 1]).broadcast_to(B2, B1, B0)
+    msk_C = (idx_b < N2).expand_dims([1, 2]).broadcast_to(B2, B1, B0) & \
+            (idx_m < N1).expand_dims([0, 2]).broadcast_to(B2, B1, B0) & \
+            (idx_n < N0).expand_dims([0, 1]).broadcast_to(B2, B1, B0)
+    tl.store(z_ptr + idx_C, tile, mask=msk_C)
     return
 
 
@@ -768,11 +808,11 @@ def quant_dot_spec(
 
 @triton.jit
 def quant_dot_kernel(
-    scale_ptr,
-    offset_ptr,
-    weight_ptr,
-    activation_ptr,
-    z_ptr,
+    scale_ptr,      # Shape: [32, 8]
+    offset_ptr,     # Shape: Int[32]
+    weight_ptr,     # Shape: Int[32, 8] -> Float[32, 64] M * K
+    activation_ptr, # Shape: [64, 32] K * N
+    z_ptr,          # Shape: [32, 32] M * N
     N0,
     N1,
     MID,
@@ -780,9 +820,24 @@ def quant_dot_kernel(
     B1: tl.constexpr,
     B_MID: tl.constexpr,
 ):
-    block_id_j = tl.program_id(0)
-    block_id_k = tl.program_id(1)
-    # Finish me!
+    # {'N0': 32, 'N1': 32, 'MID': 64} {'B0': 16, 'B1': 16, 'B_MID': 64}
+    # MNK ==> 32 x 32 x 64
+    # M(32) -> N0 -> B0
+    # N(32) -> N1 -> B1
+    block_id_m = tl.program_id(0)   # cdiv(N0, B0)
+    block_id_n = tl.program_id(1)   # cdiv(N1, B1)
+
+    idx_m = block_id_m * B0 + tl.arange(0, B0)
+    idx_n = block_id_n * B1 + tl.arange(0, B1)
+    msk_m = idx_m < B0
+    msk_n = idx_n < B1
+
+    tile = tl.zeros((B0, B1))
+
+    for k in tl.range(0, MID, B_MID):
+        
+
+        pass
     return
 
 
