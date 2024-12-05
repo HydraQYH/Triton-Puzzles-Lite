@@ -215,7 +215,8 @@ def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # We name the offsets of the pointers as "off_"
     off_x = tl.arange(0, B0)
     x = tl.load(x_ptr + off_x)
-    # Finish me!
+    x = x + 10.0
+    tl.store(z_ptr + off_x, x)
     return
 
 
@@ -236,7 +237,12 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
-    # Finish me!
+    block_id = tl.program_id(0)
+    idx = block_id * B0 + tl.arange(0, B0)  # Shape: [32]
+    msk = idx < N0 # Shape: [32]
+    x = tl.load(x_ptr + idx, mask=msk)
+    x = x + 10.0
+    tl.store(z_ptr + idx, x, mask=msk)
     return
 
 
@@ -259,7 +265,19 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
+    idx_x = tl.arange(0, B0)
+    idx_y = tl.arange(0, B1)
+    x_value = tl.load(x_ptr + idx_x)    # Shape: [B0]
+    x_value = tl.expand_dims(x_value, 0).broadcast_to(B1, B0)    # Shape: [B1, B0]
+    y_value = tl.load(y_ptr + idx_y)    # Shape: [B1]
+    y_value = tl.expand_dims(y_value, 1).broadcast_to(B1, B0)    # Shape: [B1, B0]
+    z_value = x_value + y_value
+    
+    # index compute
+    dim1 = tl.arange(0, B0).expand_dims(0).broadcast_to(B1, B0)
+    dim0 = B0 * tl.arange(0, B1).expand_dims(1).broadcast_to(B1, B0)
+    idx_z = dim0 + dim1
+    tl.store(z_ptr + idx_z, z_value)
     return
 
 
@@ -286,7 +304,23 @@ def add_vec_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
-    # Finish me!
+
+    idx_x = block_id_x * B0 + tl.arange(0, B0)
+    idx_y = block_id_y * B1 + tl.arange(0, B1)
+    mask_x = idx_x < N0
+    mask_y = idx_y < N1
+    x_value = tl.load(x_ptr + idx_x, mask=mask_x)    # Shape: [B0]
+    x_value = tl.expand_dims(x_value, 0).broadcast_to(B1, B0)    # Shape: [B1, B0]
+    y_value = tl.load(y_ptr + idx_y, mask=mask_y)    # Shape: [B1]
+    y_value = tl.expand_dims(y_value, 1).broadcast_to(B1, B0)    # Shape: [B1, B0]
+    z_value = x_value + y_value
+
+    # index compute
+    dim1 = (block_id_x * B0 + tl.arange(0, B0)).expand_dims(0).broadcast_to(B1, B0)
+    dim0 = (N0 * (block_id_y * B1 + tl.arange(0, B1))).expand_dims(1).broadcast_to(B1, B0)
+    idx_z = dim0 + dim1
+    mask_z = mask_x.expand_dims(0).broadcast_to(B1, B0) &  mask_y.expand_dims(1).broadcast_to(B1, B0)
+    tl.store(z_ptr + idx_z, z_value, mask=mask_z)
     return
 
 
@@ -313,7 +347,23 @@ def mul_relu_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
-    # Finish me!
+    idx_x = block_id_x * B0 + tl.arange(0, B0)
+    idx_y = block_id_y * B1 + tl.arange(0, B1)
+    mask_x = idx_x < N0
+    mask_y = idx_y < N1
+    x_value = tl.load(x_ptr + idx_x, mask=mask_x)    # Shape: [B0]
+    x_value = tl.expand_dims(x_value, 0).broadcast_to(B1, B0)    # Shape: [B1, B0]
+    y_value = tl.load(y_ptr + idx_y, mask=mask_y)    # Shape: [B1]
+    y_value = tl.expand_dims(y_value, 1).broadcast_to(B1, B0)    # Shape: [B1, B0]
+    z_value = x_value * y_value
+    z_value = z_value * (z_value > 0)   # ReLU
+
+    # index compute
+    dim1 = (block_id_x * B0 + tl.arange(0, B0)).expand_dims(0).broadcast_to(B1, B0)
+    dim0 = (N0 * (block_id_y * B1 + tl.arange(0, B1))).expand_dims(1).broadcast_to(B1, B0)
+    idx_z = dim0 + dim1
+    mask_z = mask_x.expand_dims(0).broadcast_to(B1, B0) & mask_y.expand_dims(1).broadcast_to(B1, B0)
+    tl.store(z_ptr + idx_z, z_value, mask=mask_z)
     return
 
 
@@ -353,7 +403,23 @@ def mul_relu_block_back_kernel(
 ):
     block_id_i = tl.program_id(0)
     block_id_j = tl.program_id(1)
-    # Finish me!
+
+    idx_i = block_id_i * B0 + tl.arange(0, B0)  # Shape: [B0]
+    mask_i = idx_i < N0
+    idx_j = block_id_j * B1 + tl.arange(0, B1)  # Shape: [B1]
+    mask_j = idx_j < N1
+
+    idx_ji = N0 * idx_j.expand_dims(1).broadcast_to(B1, B0) + idx_i.expand_dims(0).broadcast_to(B1, B0)
+    mask_ji = mask_i.expand_dims(0).broadcast_to(B1, B0) & mask_j.expand_dims(1).broadcast_to(B1, B0)
+
+    x = tl.load(x_ptr + idx_ji, mask=mask_ji)   # Shape: [B1, B0]
+    y = tl.load(y_ptr + idx_j, mask=mask_j)     # Shape: [B1]
+    y_broadcast = y.expand_dims(1).broadcast_to(B1, B0)
+    _mul = x * y_broadcast
+
+    dz = tl.load(dz_ptr + idx_ji, mask=mask_ji)   # Shape: [B1, B0]
+    dx = dz * tl.where(_mul > 0.0, 1.0, 0.0) * y_broadcast
+    tl.store(dx_ptr + idx_ji, dx, mask=mask_ji)
     return
 
 
@@ -378,7 +444,22 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
+    block_id_i = tl.program_id(0)
+    idx_i = block_id_i * B0 + tl.arange(0, B0)  # Shape: [B0]
+    mask_i = idx_i < N0
+
+    sums = tl.zeros((B0,), tl.float32)
+
+    for idx_j_start in tl.range(0, T, B1):
+        idx_j = idx_j_start + tl.arange(0, B1)
+        mask_j = idx_j < T
+        idx_ij = idx_i.expand_dims(1).broadcast_to(B0, B1) * T + idx_j.expand_dims(0).broadcast_to(B0, B1)
+        mask_ij = mask_i.expand_dims(1).broadcast_to(B0, B1) & mask_j.expand_dims(0).broadcast_to(B0, B1)
+        vals = tl.load(x_ptr + idx_ij, mask=mask_ij)    # Shape: [B0, B1]
+        sums += vals.sum(axis=1)
+
+    tl.store(z_ptr + idx_i, sums, mask=mask_i)
+
     return
 
 
@@ -419,7 +500,37 @@ def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     """2 loops ver."""
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
-    # Finish me!
+
+    idx_i = block_id_i * B0 + tl.arange(0, B0)  # Shape: [B0]
+    mask_i = idx_i < N0
+
+    global_maxs = tl.full([B0], -float("inf"), dtype=tl.float32)
+    sums = tl.zeros([B0], dtype=tl.float32)
+
+    for idx_j_start in tl.range(0, T, B1):
+        idx_j = idx_j_start + tl.arange(0, B1)
+        mask_j = idx_j < T
+        idx_ij = idx_i.expand_dims(1).broadcast_to(B0, B1) * T + idx_j.expand_dims(0).broadcast_to(B0, B1)
+        mask_ij = mask_i.expand_dims(1).broadcast_to(B0, B1) & mask_j.expand_dims(0).broadcast_to(B0, B1)
+        vals = tl.load(x_ptr + idx_ij, mask=mask_ij)    # Shape: [B0, B1]
+
+        # Update MAX
+        last_maxs = global_maxs
+        global_maxs = tl.maximum(global_maxs, vals.max(1))
+        factory = tl.exp2(log2_e * (last_maxs - global_maxs))
+
+        local_sum = tl.exp2(log2_e * (vals - global_maxs.expand_dims(1).broadcast_to(B0, B1))).sum(1)
+        sums = sums * factory + local_sum
+    
+    for idx_j_start in tl.range(0, T, B1):
+        idx_j = idx_j_start + tl.arange(0, B1)
+        mask_j = idx_j < T
+        idx_ij = idx_i.expand_dims(1).broadcast_to(B0, B1) * T + idx_j.expand_dims(0).broadcast_to(B0, B1)
+        mask_ij = mask_i.expand_dims(1).broadcast_to(B0, B1) & mask_j.expand_dims(0).broadcast_to(B0, B1)
+        vals = tl.load(x_ptr + idx_ij, mask=mask_ij)
+
+        softmaxs = tl.exp2(log2_e * (vals - global_maxs.expand_dims(1).broadcast_to(B0, B1))) / sums.expand_dims(1).broadcast_to(B0, B1)
+        tl.store(z_ptr + idx_ij, softmaxs, mask=mask_ij)
     return
 
 
@@ -467,8 +578,42 @@ def flashatt_kernel(
 ):
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
-    myexp = lambda x: tl.exp2(log2_e * x)
-    # Finish me!
+    # myexp = lambda x: tl.exp2(log2_e * x)
+
+    idx_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = idx_i < N0
+
+    global_maxs = tl.full([B0], -float("inf"), dtype=tl.float32)
+    sums = tl.zeros([B0], dtype=tl.float32)
+    result = tl.zeros([B0], dtype=tl.float32)
+
+    for idx_j_start in tl.range(0, T, B1):
+        idx_j = idx_j_start + tl.arange(0, B1)
+        mask_j = idx_j < T
+
+        # Slice Q & K
+        q = tl.load(q_ptr + idx_i, mask=mask_i).expand_dims(1)  # Shape: [B0, 1]
+        k = tl.load(k_ptr + idx_j, mask=mask_j).expand_dims(0)  # Shape: [1, B1]
+        qk = q.broadcast_to(B0, B1) * k.broadcast_to(B0, B1)  # Shape: [B0, B1]
+
+        # Compute factory
+        last_maxs = global_maxs
+        global_maxs = tl.maximum(global_maxs, qk.max(1))
+        factory = tl.exp2(log2_e * (last_maxs - global_maxs))   # Shape: [B0]
+
+        # Compute expsum
+        global_maxs_expand = global_maxs.expand_dims(1).broadcast_to(B0, B1)    # Shape: [B0, B1]
+        qk_exp = tl.exp2(log2_e * (qk - global_maxs_expand))
+        local_sum = qk_exp.sum(1)
+        sums = sums * factory + local_sum
+
+        # Compute softmax without normalization
+        v = tl.load(v_ptr + idx_j, mask=mask_j).expand_dims(0).broadcast_to(B0, B1)  # Shape: [B0, B1]
+        local_result = (qk_exp * v).sum(1)   # Shape: [B1, 1]
+        result = result * factory + local_result
+
+    result /= sums
+    tl.store(z_ptr + idx_i, result, mask=mask_i)
     return
 
 
@@ -501,7 +646,31 @@ def conv2d_kernel(
     x_ptr, k_ptr, z_ptr, N0, H, W, KH: tl.constexpr, KW: tl.constexpr, B0: tl.constexpr
 ):
     block_id_i = tl.program_id(0)
-    # Finish me!
+
+    idx_kernel = KW * tl.arange(0, KH).expand_dims(1).broadcast_to(KH, KW) + tl.arange(0, KW).expand_dims(0).broadcast_to(KH, KW)
+    kernel = tl.load(k_ptr + idx_kernel)    # Shape: [kH, KW]
+
+    offset_b = (block_id_i * B0 + tl.arange(0, B0)).expand_dims([1, 2]).broadcast_to(B0, KH, KW) * H * W
+    mask_b = ((block_id_i * B0 + tl.arange(0, B0)) < N0).expand_dims([1, 2]).broadcast_to(B0, KH, KW)
+
+    for h in tl.range(0, H):
+        offset_h = tl.arange(h, h + KH).expand_dims([0, 2]).broadcast_to(B0, KH, KW) * W
+        mask_h = (tl.arange(h, h + KH) < H).expand_dims([0, 2]).broadcast_to(B0, KH, KW)
+
+        for w in tl.range(0, W):
+            offset_w = tl.arange(w, w + KW).expand_dims([0, 1]).broadcast_to(B0, KH, KW)
+            mask_w = (tl.arange(w, w + KW) < W).expand_dims([0, 1]).broadcast_to(B0, KH, KW)
+
+            offset_tile = offset_b + offset_h + offset_w
+            mask_tile = mask_b & mask_h & mask_w
+
+            inp = tl.load(x_ptr + offset_tile, mask=mask_tile)  # Shape: [B0, KH, KW]
+            conv = (inp * kernel.expand_dims(0).broadcast_to(B0, KH, KW)).sum(2).sum(1)    # Shape: [B0]
+
+            out_idx = (block_id_i * B0 + tl.arange(0, B0)) * H * W + h * W + w
+            out_mask = (block_id_i * B0 + tl.arange(0, B0)) < N0
+            tl.store(z_ptr + out_idx, conv, mask=out_mask)
+
     return
 
 
