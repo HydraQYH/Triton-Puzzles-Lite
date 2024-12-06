@@ -808,11 +808,11 @@ def quant_dot_spec(
 
 @triton.jit
 def quant_dot_kernel(
-    scale_ptr,      # Shape: [32, 8]
-    offset_ptr,     # Shape: Int[32]
-    weight_ptr,     # Shape: Int[32, 8] -> Float[32, 64] M * K
-    activation_ptr, # Shape: [64, 32] K * N
-    z_ptr,          # Shape: [32, 32] M * N
+    scale_ptr,      # Shape: [32, 8] --> [N0, MID // GROUP]
+    offset_ptr,     # Shape: Int[32] --> [N0, (MID // GROUP // FPINT)]
+    weight_ptr,     # Shape: Int[32, 8] --> [N0, MID // FPINT] -> Float[32, 64] M * K
+    activation_ptr, # Shape: K * N [64, 32] --> [MID, N1]
+    z_ptr,          # Shape: M * N [32, 32] --> [N0, N1]
     N0,
     N1,
     MID,
@@ -827,17 +827,75 @@ def quant_dot_kernel(
     block_id_m = tl.program_id(0)   # cdiv(N0, B0)
     block_id_n = tl.program_id(1)   # cdiv(N1, B1)
 
-    idx_m = block_id_m * B0 + tl.arange(0, B0)
-    idx_n = block_id_n * B1 + tl.arange(0, B1)
-    msk_m = idx_m < B0
-    msk_n = idx_n < B1
+    idx_m = block_id_m * B0 + tl.arange(0, B0)  # Shape: [B0]
+    idx_n = block_id_n * B1 + tl.arange(0, B1)  # Shape: [B1]
+    msk_m = idx_m < N0
+    msk_n = idx_n < N1
 
-    tile = tl.zeros((B0, B1))
+    tile = tl.zeros((B0, B1), dtype=tl.float32)
+
+    tl.static_assert(MID % FPINT == 0, "MID % FPINT != 0")
+    tl.static_assert(B_MID % FPINT == 0, "B_MID % FPINT != 0")
+    tl.static_assert(MID % B_MID == 0, "B_MID % FPINT != 0")
+    tl.static_assert((MID // FPINT) % (B_MID // FPINT) == 0, "(MID // FPINT) % (B_MID // FPINT) != 0")
+
+    tl.static_assert(MID % GROUP == 0, "MID % GROUP != 0")
 
     for k in tl.range(0, MID, B_MID):
-        
+        # Load Weight [B0, B_MID // FPINT] --> [B0, B_MID]
+        idx_scaled_k = (k // FPINT) + tl.arange(0, B_MID // FPINT)   # Shape: [B_MID // FPINT]
+        mask_scaled_k = idx_scaled_k < (MID // FPINT)
+        idx_quant_weight = idx_m.expand_dims(1).broadcast_to(B0, B_MID // FPINT) * (MID // FPINT) + \
+                            idx_scaled_k.expand_dims(0).broadcast_to(B0, B_MID // FPINT)    # Shape: [B0, B_MID // FPINT]
+        msk_quant_weight = msk_m.expand_dims(1).broadcast_to(B0, B_MID // FPINT) & \
+                            mask_scaled_k.expand_dims(0).broadcast_to(B0, B_MID // FPINT)
+        quant_weight = tl.load(weight_ptr + idx_quant_weight, mask=msk_quant_weight)    # Shape: [B0, B_MID // FPINT]
+        BITS = 32 // FPINT
+        quant_weight = (quant_weight.expand_dims(2) >> (tl.arange(0, FPINT) * (32 // FPINT))) & ((1 << BITS) - 1)   # Shape: [B0, B_MID // FPINT, FPINT]
+        quant_weight = quant_weight.reshape(B0, B_MID)
 
-        pass
+        # Load Scale
+        idx_k = k + tl.arange(0, B_MID) # Shape: [B_MID]
+        idx_scale = idx_k // GROUP  # Shape: [B_MID]
+        # idx_scale: [0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,......,7,7,7,7,7,7,7,7]
+        msk_scale = idx_scale < (MID // GROUP)
+        idx_scale_factory = idx_m.expand_dims(1).broadcast_to(B0, B_MID) * (MID // GROUP) + \
+                            idx_scale.expand_dims(0).broadcast_to(B0, B_MID)
+        msk_scale_factory = msk_m.expand_dims(1).broadcast_to(B0, B_MID) & \
+                            msk_scale.expand_dims(0).broadcast_to(B0, B_MID)
+        scale = tl.load(scale_ptr + idx_scale_factory, mask=msk_scale_factory)  # Shape: [B0, B_MID]
+
+        # Load Offset
+        # Offset Shape: [B0, B_MID // GROUP // FPINT]
+        idx_offset = idx_k // GROUP // FPINT    # Shape:[B0, B_MID]
+        # idx_offset: full of zeros
+        msk_offset = idx_offset < (B_MID // GROUP // FPINT)
+        _idx_offset = idx_m.expand_dims(1).broadcast_to(B0, B_MID) * (MID // GROUP // FPINT) + \
+                        idx_offset.expand_dims(0).broadcast_to(B0, B_MID)
+        _msk_offset = msk_m.expand_dims(1).broadcast_to(B0, B_MID) & \
+                        msk_offset.expand_dims(0).broadcast_to(B0, B_MID)
+        offset = tl.load(offset_ptr + _idx_offset, mask=_msk_offset)    # Shape: [B0, B_MID]
+        offset_shifts = (tl.arange(0, FPINT) * (32 // FPINT)).expand_dims(1).broadcast_to(FPINT, GROUP).reshape(B_MID)
+        # offset_shifts: [0,0,0,0,0,0,0,0,0,4,4,4,4,4,4,4,4,......,28,28,28,28,28,28,28,28]
+        offset = (offset >> offset_shifts) & ((1 << BITS) - 1)
+
+        # dequantization
+        dequant_weight = scale * (quant_weight - offset)
+
+        # Load Activation Shape: [B_MID, B1]
+        idx_act = idx_k.expand_dims(1).broadcast_to(B_MID, B1) * N1 + \
+                    idx_n.expand_dims(0).broadcast_to(B_MID, B1)
+        msk_act = (idx_k < MID).expand_dims(1).broadcast_to(B_MID, B1) & \
+                    msk_n.expand_dims(0).broadcast_to(B_MID, B1)
+        act = tl.load(activation_ptr + idx_act, mask=msk_act)
+
+        tile += tl.dot(dequant_weight, act)
+
+    idx_out = idx_m.expand_dims(1).broadcast_to(B0, B1) * N1 + \
+                idx_n.expand_dims(0).broadcast_to(B0, B1)
+    msk_out = msk_m.expand_dims(1).broadcast_to(B0, B1) & \
+                msk_n.expand_dims(0).broadcast_to(B0, B1)
+    tl.store(z_ptr + idx_out, tile, mask=msk_out)
     return
 
 
